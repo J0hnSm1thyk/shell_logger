@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
@@ -30,22 +31,36 @@ type LogEntry struct {
 	Error      string `json:"error"`
 }
 
+// カレントディレクトリをGoプロセス側で追跡する
+var currentDir string
+
+func init() {
+	if dir, err := os.Getwd(); err == nil {
+		currentDir = dir
+	}
+}
+
 func detectPowerShell() string {
-	_, err := exec.LookPath("pwsh.exe")
-	if err == nil {
+	if _, err := exec.LookPath("pwsh.exe"); err == nil {
 		return "pwsh.exe"
 	}
 	return "powershell.exe"
 }
 
+// UTF-8として有効なバイト列はそのまま使用し、そうでない場合のみShift-JIS変換を試みる。
+// 以前は常にShift-JIS変換していたため、chcp 65001 / PowerShell UTF-8設定後の出力が二重変換されて文字化けしていた。
 func normalizeOutput(b []byte) string {
-	// CP932（Shift-JIS）→ UTF-8変換を試みる
-	decoder := japanese.ShiftJIS.NewDecoder()
-	decoded, _, err := transform.Bytes(decoder, b)
-	if err != nil {
-		decoded = b
+	var s string
+	if utf8.Valid(b) {
+		s = string(b)
+	} else {
+		decoder := japanese.ShiftJIS.NewDecoder()
+		decoded, _, err := transform.Bytes(decoder, b)
+		if err != nil {
+			decoded = b
+		}
+		s = string(decoded)
 	}
-	s := string(decoded)
 	s = strings.ReplaceAll(s, "\x00", "")
 	return strings.TrimSpace(s)
 }
@@ -76,17 +91,29 @@ func runCommand(shell string, command string) LogEntry {
 		return LogEntry{}
 	}
 
+	// コマンド実行後のカレントディレクトリをテンプファイル経由で取得する。
+	// stderr 経由の for/f アプローチは cmd.exe 内部コマンドのリダイレクト挙動に依存するため不安定だった。
+	tmpFile := filepath.Join(os.TempDir(),
+		fmt.Sprintf("sl_%d_%d.tmp", os.Getpid(), start.UnixNano()))
+	defer os.Remove(tmpFile)
+
 	if shell == "ps" {
 		ps := detectPowerShell()
 		actualShell = ps
-		// OutputEncodingをUTF-8に強制
-		psCommand := "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + command
+		psCommand := fmt.Sprintf(
+			`[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; %s; [System.IO.File]::WriteAllText("%s", (Get-Location).Path)`,
+			command, tmpFile,
+		)
 		cmd = exec.Command(ps, "-NoProfile", "-NonInteractive", "-Command", psCommand)
 	} else {
 		actualShell = "cmd.exe"
-		// chcp 65001でUTF-8に統一してからコマンド実行
-		cmd = exec.Command("cmd.exe", "/c", "chcp 65001 > nul && "+command)
+		// cd を単体で実行するとカレントディレクトリを stdout へ出力するので、それをファイルに書き出す
+		wrapped := fmt.Sprintf(`chcp 65001 > nul && (%s) & cd > "%s"`, command, tmpFile)
+		cmd = exec.Command("cmd.exe", "/c", wrapped)
 	}
+
+	// サブプロセスの開始ディレクトリを追跡中のディレクトリに設定することで cd が機能するようにする
+	cmd.Dir = currentDir
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -98,6 +125,16 @@ func runCommand(shell string, command string) LogEntry {
 	exitCode := 0
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
+	}
+
+	// テンプファイルからカレントディレクトリを読み取る
+	if dirBytes, readErr := os.ReadFile(tmpFile); readErr == nil {
+		// PowerShell 5.x は UTF-8 BOM を付与する場合があるので除去する
+		dirBytes = bytes.TrimPrefix(dirBytes, []byte{0xEF, 0xBB, 0xBF})
+		newDir := strings.TrimSpace(strings.ReplaceAll(string(dirBytes), "\x00", ""))
+		if newDir != "" {
+			currentDir = newDir
+		}
 	}
 
 	entry := LogEntry{
@@ -150,6 +187,13 @@ func writeLog(entry LogEntry, logfile string) error {
 	return err
 }
 
+func currentPrompt(shell string) string {
+	if shell == "ps" {
+		return fmt.Sprintf("PS %s> ", currentDir)
+	}
+	return fmt.Sprintf("%s> ", currentDir)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
@@ -183,11 +227,7 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		if shell == "ps" {
-			fmt.Print("PS> ")
-		} else {
-			fmt.Print("CMD> ")
-		}
+		fmt.Print(currentPrompt(shell))
 
 		if !scanner.Scan() {
 			break

@@ -91,19 +91,21 @@ pause
 [shell_logger] 終了するには exit と入力してください
 [shell_logger] シェル切り替え: !cmd または !ps
 
-CMD> whoami
+C:\tools> whoami
 desktop-xxx\tanaka
 
-CMD> ipconfig
+C:\tools> cd C:\Users\tanaka\Documents
+
+C:\Users\tanaka\Documents> ipconfig
 ...
 
-CMD> !ps
+C:\Users\tanaka\Documents> !ps
 [shell_logger] PowerShell に切り替えました
 
-PS> Get-Process
+PS C:\Users\tanaka\Documents> Get-Process
 ...
 
-PS> exit
+PS C:\Users\tanaka\Documents> exit
 [shell_logger] セッション終了
 ```
 
@@ -179,7 +181,6 @@ Get-Content 2026-05-03.json | ConvertFrom-Json | Where-Object { $_.command -like
 | コマンド例 | 理由 |
 |------------|------|
 | `more`、`pause`、`choice` | ユーザー入力待ちが発生しハングする |
-| `cd C:\Users` | 次のコマンドにディレクトリが引き継がれない |
 | `set FOO=bar` | 環境変数が次のコマンドに引き継がれない |
 
 ### ログの注意
